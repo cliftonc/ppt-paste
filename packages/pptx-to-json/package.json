@@ -1,6 +1,6 @@
 {
   "name": "@cliftonc/pptx-to-json",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Parse PowerPoint files (PPTX) and PowerPoint clipboard data into structured JSON — slides in presentation order, titles, speaker notes, geometry, connectors, tables and images.",
   "license": "MIT",
   "author": "Clifton Cunningham",
@@ -38,7 +38,9 @@
     "README.md"
   ],
   "scripts": {
-    "build": "tsc",
+    "build": "rm -rf dist tsconfig.tsbuildinfo && tsc",
+    "verify:dist": "node test/verify-dist.mjs",
+    "prepublishOnly": "npm run build && npm run verify:dist",
     "build:watch": "tsc --watch",
     "type-check": "tsc --noEmit",
     "test": "vitest",
