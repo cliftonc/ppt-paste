@@ -2,6 +2,7 @@
   "name": "pptx-to-json-monorepo",
   "version": "0.1.0",
   "private": true,
+  "license": "MIT",
   "type": "module",
   "scripts": {
     "dev": "pnpm --filter worker dev & pnpm --filter worker dev:client",

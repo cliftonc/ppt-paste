@@ -1,6 +1,26 @@
 {
   "name": "@cliftonc/pptx-to-json",
-  "version": "0.1.1",
+  "version": "0.2.0",
+  "description": "Parse PowerPoint files (PPTX) and PowerPoint clipboard data into structured JSON — slides in presentation order, titles, speaker notes, geometry, connectors, tables and images.",
+  "license": "MIT",
+  "author": "Clifton Cunningham",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cliftonc/pptx-to-json.git",
+    "directory": "packages/pptx-to-json"
+  },
+  "homepage": "https://github.com/cliftonc/pptx-to-json#readme",
+  "bugs": {
+    "url": "https://github.com/cliftonc/pptx-to-json/issues"
+  },
+  "keywords": [
+    "pptx",
+    "powerpoint",
+    "ooxml",
+    "parser",
+    "json",
+    "slides"
+  ],
   "type": "module",
   "main": "./dist/index.js",
   "module": "./dist/index.js",
@@ -13,7 +33,9 @@
     }
   },
   "files": [
-    "dist"
+    "dist",
+    "LICENSE",
+    "README.md"
   ],
   "scripts": {
     "build": "tsc",
