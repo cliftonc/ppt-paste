@@ -3,6 +3,7 @@
  */
 
 import { BaseParser } from "./BaseParser.js";
+import { TextParser } from "./TextParser.js";
 import {
   XMLNode,
   TableComponent,
@@ -135,8 +136,10 @@ export class TableParser extends BaseParser {
   static extractCellText(txBody: XMLNode | null | undefined): string {
     if (!txBody) return "";
     try {
-      // Reuse TextParser logic to ensure consistent bullet / spacing handling (bullets ignored inside tables for now)
-      const { TextParser } = require('./TextParser.js');
+      // Reuse TextParser logic to ensure consistent bullet / spacing handling (bullets ignored inside tables for now).
+      // Imported statically: this package is ESM, where `require` is not defined — and the
+      // ReferenceError landed in the catch below, so every cell in every table came back
+      // empty and said nothing about it.
       const text = TextParser.extractTextContent(txBody);
       return (text || '').trim();
     } catch (error) {
