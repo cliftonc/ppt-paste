@@ -99,8 +99,23 @@ export interface NormalizedConnectionElement extends NormalizedElementBase {
 export interface NormalizedSlide {
   /** Source file path (ppt/slides/slide1.xml or clipboard/drawings/drawing1.xml) */
   slideFile: string;
-  /** 1-based slide number for pptx; undefined for clipboard */
+  /** 1-based position in PRESENTATION order (p:sldIdLst); undefined for clipboard */
   slideNumber?: number;
+  /**
+   * The number in the slide's filename — creation order, NOT what the audience sees.
+   * Kept because the rels graph is keyed on it: `ppt/slides/_rels/slide<n>.xml.rels`.
+   */
+  fileSlideNumber?: number;
+  /** The slide's own relationship part, for resolving its media without arithmetic on slide numbers */
+  slideRelsFile?: string;
+  /** Text of the title placeholder, when the slide has one (27% of real slides do not) */
+  title?: string;
+  /** Whether the title placeholder named itself, or was named by the layout via its idx */
+  titleSource?: 'placeholder' | 'layout';
+  /** Speaker notes, when the slide has any beyond the auto-generated slide-number field */
+  notes?: string;
+  /** Notes part resolved through the rels graph — never paired by filename number */
+  notesFile?: string | null;
   /** Original format: 'pptx' | 'clipboard' */
   format: NormalizedFormat;
   /** Legacy collections (pre-normalization parsing still references these) */
@@ -135,6 +150,11 @@ export type MediaFiles = Record<string, Uint8Array>;
 export interface NormalizedResult {
   format: NormalizedFormat;
   slides: NormalizedSlide[];
+  /**
+   * How the slide order was decided: 'presentation' means p:sldIdLst was read,
+   * 'filename' means it could not be and creation order was assumed.
+   */
+  slideOrderSource?: 'presentation' | 'filename';
   slideDimensions?: { width: number; height: number };
   mediaFiles: MediaFiles;
   relationships: RelationshipGraph;

@@ -35,7 +35,7 @@ export class DiagramParser extends BaseParser {
     slideIndex: number,
     zIndex: number,
     parsedFiles?: Record<string, XMLNode | Uint8Array | string>,
-    options: { returnExtractedComponents?: boolean } = {}
+    options: { returnExtractedComponents?: boolean; slideRelsFile?: string | null } = {}
   ): Promise<DiagramComponent | PowerPointComponent[] | null> {
     const { spPr, nvGraphicFramePr, graphicData } = diagramComponent;
 
@@ -68,7 +68,12 @@ export class DiagramParser extends BaseParser {
         // Extract SmartArt data if we have access to parsed files
         if (parsedFiles) {
           try {
-            smartArtData = await DiagramParser.extractSmartArtData(relIds, parsedFiles, slideIndex);
+            smartArtData = await DiagramParser.extractSmartArtData(
+              relIds,
+              parsedFiles,
+              slideIndex,
+              options.slideRelsFile ?? null
+            );
             if (smartArtData) {
               // Generate individual components from SmartArt data
               extractedComponents = DiagramParser.generateComponentsFromSmartArt(
@@ -168,7 +173,8 @@ export class DiagramParser extends BaseParser {
   static async extractSmartArtData(
     relIds: any,
     parsedFiles: Record<string, XMLNode | Uint8Array | string>,
-    currentSlideIndex?: number
+    currentSlideIndex?: number,
+    slideRelsFile?: string | null
   ): Promise<{
     dataPoints: SmartArtDataPoint[];
     connections: SmartArtConnection[];
@@ -186,7 +192,12 @@ export class DiagramParser extends BaseParser {
       // If we can't determine specific files, fall back to all diagram files
       if (relIds && typeof relIds === 'object') {
         // Look through the graphicData for relationship references
-        const relationsFound = this.extractRelationshipTargets(relIds, parsedFiles, currentSlideIndex);
+        const relationsFound = this.extractRelationshipTargets(
+          relIds,
+          parsedFiles,
+          currentSlideIndex,
+          slideRelsFile
+        );
         
         if (relationsFound.dataFiles.length > 0 || relationsFound.drawingFiles.length > 0) {
           specificDataFiles = relationsFound.dataFiles;
@@ -256,7 +267,8 @@ export class DiagramParser extends BaseParser {
   static extractRelationshipTargets(
     relIds: any,
     parsedFiles: Record<string, XMLNode | Uint8Array | string>,
-    currentSlideIndex?: number
+    currentSlideIndex?: number,
+    slideRelsFile?: string | null
   ): {
     dataFiles: string[];
     drawingFiles: string[];
@@ -280,8 +292,11 @@ export class DiagramParser extends BaseParser {
       }
     }
     
-    // Find the correct slide relationship file
-    const slideRelsPath = `ppt/slides/_rels/slide${(currentSlideIndex || 0) + 1}.xml.rels`;
+    // Find the correct slide relationship file. The slide's own rels part is passed in
+    // wherever it is known; deriving it from the slide index assumes presentation order
+    // matches the slide's FILE number, which a reordered deck breaks.
+    const slideRelsPath =
+      slideRelsFile || `ppt/slides/_rels/slide${(currentSlideIndex || 0) + 1}.xml.rels`;
     
     const slideRels = parsedFiles[slideRelsPath] as XMLNode;
     if (slideRels && slideRels['Relationships']) {

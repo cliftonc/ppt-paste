@@ -12,6 +12,8 @@ Try it out at **[ppt-paste.clifton-cunningham.workers.dev](https://ppt-paste.cli
 - **Clipboard Data Parsing**: Handle PowerPoint clipboard paste operations
 - **Component Extraction**: Extract text, shapes, images, tables, and more
 - **Position & Styling**: Get accurate positioning, dimensions, and styling information
+- **Slide structure**: presentation order, titles and speaker notes, resolved through the
+  relationship graph rather than guessed from filenames (see [Slide structure](#slide-structure))
 - **TypeScript Support**: Full TypeScript definitions included
 - **Modular Architecture**: Extensible parser system for different component types
 
@@ -26,26 +28,51 @@ npm install @cliftonc/pptx-to-json
 ### Parsing PPTX Files
 
 ```typescript
-import { parsePptx } from '@cliftonc/pptx-to-json';
+import { PPTXParser, PowerPointParser } from '@cliftonc/pptx-to-json';
+import fs from 'node:fs';
 
-// Parse a PPTX file from buffer
 const buffer = fs.readFileSync('presentation.pptx');
-const result = await parsePptx(buffer);
 
-console.log(result.slides); // Array of slides with components
+// 1. unzip + parse every part to JSON
+const json = await new PPTXParser().buffer2json(buffer);
+
+// 2. turn that into slides and components
+const result = await new PowerPointParser().parseJson(json);
+
+for (const slide of result.slides) {
+  console.log(slide.slideNumber, slide.title);   // presentation order, title placeholder
+  console.log(slide.notes);                      // speaker notes, if any
+  console.log(slide.components.length);
+}
 ```
 
 ### Parsing Clipboard Data
 
 ```typescript
-import { parseClipboard } from '@cliftonc/pptx-to-json';
+import { PowerPointClipboardProcessor } from '@cliftonc/pptx-to-json';
 
-// Parse PowerPoint clipboard data
-const clipboardBuffer = /* clipboard binary data */;
-const result = await parseClipboard(clipboardBuffer);
+const processor = new PowerPointClipboardProcessor();
+const result = await processor.parseClipboardBuffer(clipboardBuffer);
 
-console.log(result.components); // Extracted components
+console.log(result.slides);
 ```
+
+## Slide structure
+
+Three answers are resolved through the package relationship graph, because the obvious
+shortcut is wrong in ways that are hard to notice afterwards:
+
+| | Read from | Why not the obvious way |
+|---|---|---|
+| `slide.slideNumber` | `ppt/presentation.xml` → `p:sldIdLst` → `r:id` | Slide **filenames are creation order**. PowerPoint keeps a slide's part name when a deck is reordered, so `slide3.xml` can be the seventh slide shown. `result.slideOrderSource` reports whether this list could be read; `slide.metadata.fileSlideNumber` keeps the filename number. |
+| `slide.notes` | `ppt/slides/_rels/slideN.xml.rels` → `notesSlide` | A notes part exists only for slides that HAVE notes, so `notesSlideM` stops lining up with `slideN` as soon as one slide lacks them. Notes attributed to the wrong slide are worse than no notes at all. Only the body placeholder is read: nearly every real notes part contains just the auto-generated slide-number field, which would otherwise be returned as "notes". |
+| `slide.title` | `p:ph type="title"\|"ctrTitle"`, else the layout's placeholder for that `idx` | A slide's placeholder often omits `@type` and is named only by the layout it inherits from. `slide.metadata.titleSource` says which of the two answered. |
+
+> ⚠️ **Do not set `removeNSPrefix: true` on the `XMLParser`.** It merges `id` and `r:id`
+> into one key, and which one wins depends on attribute order in the source — slide-order
+> resolution would appear to work on most decks and silently mis-resolve on others. The
+> parser is configured with `ignoreAttributes: false` and `attributeNamePrefix: "$"`, and
+> does **not** strip prefixes. Keep it that way.
 
 # PowerPoint Parse Output Format Specification
 
@@ -70,11 +97,12 @@ Depending on which public API you call (e.g. legacy wrappers like `parsePptx` / 
 ### 1.1 ParsedResult (Primary External Shape)
 ```
 interface ParsedResult {
-  slides: ParsedSlide[];            // Ordered by slideNumber ascending
+  slides: ParsedSlide[];            // In presentation order
   masters: Record<string, ParsedMaster>; // Keyed by master XML path (ppt/slideMasters/slideMasterX.xml)
   layouts: Record<string, ParsedLayout>; // Keyed by layout XML path (ppt/slideLayouts/slideLayoutY.xml)
   totalComponents: number;          // Total count across all slides (after expansions)
   format: 'pptx' | 'clipboard';     // Source format detected by normalizer
+  slideOrderSource?: 'presentation' | 'filename'; // Whether p:sldIdLst decided the order
   slideDimensions?: { width: number; height: number }; // In pixels (EMU converted)
 }
 ```
@@ -82,8 +110,10 @@ interface ParsedResult {
 ### 1.2 ParsedSlide
 ```
 interface ParsedSlide {
-  slideIndex: number;        // Zero-based internal index
-  slideNumber: number;       // One-based number from underlying filename (slideN.xml)
+  slideIndex: number;        // Zero-based position in presentation order
+  slideNumber: number;       // One-based position in presentation order
+  title?: string;            // Title placeholder text, when the slide has one
+  notes?: string;            // Speaker notes, when the slide has any
   layoutId?: string;         // Derived from layout file name (slideLayoutX)
   background?: PowerPointComponent; // Background image/shape (if non-white & accepted)
   components: PowerPointComponent[]; // All foreground components, including background IF pushed into flow earlier
@@ -91,7 +121,7 @@ interface ParsedSlide {
 }
 
 interface SlideMetadata {
-  name: string;                    // e.g. 'Slide 1'
+  name: string;                    // The slide title, or 'Slide N' when it has none
   componentCount: number;          // components.length
   format: 'pptx' | 'clipboard';
   slideFile: string | null;        // e.g. 'ppt/slides/slide1.xml'
@@ -99,6 +129,9 @@ interface SlideMetadata {
   masterFile: string | null;       // e.g. 'ppt/slideMasters/slideMaster1.xml'
   layoutElementCount: number;      // Count of inherited layout elements (pre-filter)
   masterElementCount: number;      // Count of inherited master elements (pre-filter)
+  notesFile: string | null;        // e.g. 'ppt/notesSlides/notesSlide2.xml'
+  fileSlideNumber: number | null;  // The number in the filename — creation order
+  titleSource: 'placeholder' | 'layout' | null; // How the title was identified
 }
 ```
 
@@ -399,7 +432,9 @@ Metadata fields assist post-processing:
 ## 10. Media & Relationship Resolution
 
 Images & videos use relationship graphs:
-- PPTX mode: relationships are file-based (`ppt/slides/_rels/slideN.xml.rels`).
+- PPTX mode: relationships are file-based (`ppt/slides/_rels/slideN.xml.rels`), and the
+  slide's own rels part is passed down explicitly. Deriving it from the slide's position
+  would read another slide's relationships once a deck has been reordered.
 - Clipboard mode: relationships stored in a simplified map keyed by slide index.
 - Background images restructure `blipFill` to surface `embed` id for uniform handling.
 - Video thumbnails resolve through nested `blipFill` -> `embed` in `thumbnailRelationshipId` if present.

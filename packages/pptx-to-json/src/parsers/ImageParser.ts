@@ -21,8 +21,11 @@ export class ImageParser extends BaseParser {
    * @param relationships - Relationship data
    * @param mediaFiles - Media files
    * @param componentIndex - Component index
-   * @param slideIndex - Slide index
+   * @param slideIndex - Slide index (position in presentation order; also the component's own slideIndex)
    * @param r2Storage - Optional R2 storage for image hosting
+   * @param slideRelsFile - The slide's own .rels part. Pass it whenever you have it:
+   *   deriving the path from `slideIndex` assumes presentation order matches the slide's
+   *   FILE number, which stops being true the moment a deck is reordered.
    * @returns Parsed image component
    */
   static async parseFromNormalized(
@@ -33,6 +36,7 @@ export class ImageParser extends BaseParser {
     slideIndex: number,
     zIndex: number,
     r2Storage: any = null,
+    slideRelsFile: string | null = null,
   ): Promise<ImageComponent | null> {
     const { data, spPr, nvPicPr, blipFill, namespace } = imageComponent;
 
@@ -67,6 +71,7 @@ export class ImageParser extends BaseParser {
         mediaFiles,
         slideIndex,
         r2Storage,
+        slideRelsFile,
       );
       if (imageInfo.url) {
         imageDataUrl = imageInfo.url;
@@ -210,6 +215,7 @@ export class ImageParser extends BaseParser {
    * @param mediaFiles - Media files data
    * @param slideIndex - Slide index for slide-scoped search
    * @param r2Storage - Optional R2 storage
+   * @param slideRelsFile - The slide's own .rels part; preferred over deriving one from slideIndex
    * @returns image information
    */
   static async getImageInfo(
@@ -218,6 +224,7 @@ export class ImageParser extends BaseParser {
     mediaFiles: Record<string, Uint8Array>,
     slideIndex: number | null = null,
     r2Storage: any = null,
+    slideRelsFile: string | null = null,
   ): Promise<ImageInfo> {
     if (!rId) {
       return {
@@ -234,8 +241,12 @@ export class ImageParser extends BaseParser {
     );
 
     // For PPTX files (not clipboard), search current slide first, then slide layouts/masters
-    if (slideIndex !== null && !isClipboardFormat) {
-      const currentSlideRelFile = `ppt/slides/_rels/slide${slideIndex + 1}.xml.rels`;
+    if ((slideRelsFile || slideIndex !== null) && !isClipboardFormat) {
+      // Prefer the slide's actual rels part. `slideIndex + 1` is the slide's presentation
+      // position, and the rels graph is keyed on the FILE number — the same thing only
+      // until a deck is reordered.
+      const currentSlideRelFile =
+        slideRelsFile || `ppt/slides/_rels/slide${(slideIndex as number) + 1}.xml.rels`;
 
       // First try the current slide's relationship file
       if (relationships[currentSlideRelFile]) {

@@ -21,6 +21,22 @@ To test changes you are making you simply re-run the log-bin to see the output a
 
 **`/packages/pptx-to-json/src/processors`** - Core processor for PPTX (or clipboard).  Clipboard content is actually the same structure, just with a different namespace - solved via the normalizer - and without a slide master / layout.
 
+### Raw vs namespace-stripped JSON — the one rule that bites
+
+`PowerPointNormalizer.normalize()` strips every namespace prefix (`p:spPr` → `spPr`) and
+almost all parsing works on that stripped tree. **The relationship graph does not.**
+`p:sldId` carries both an `id` and an `r:id`, and stripping merges them, so slide order would
+resolve correctly on most decks and silently wrongly on others. Anything reading `r:id` —
+`PPTXParser.getSlideOrder`, `getSlideNotesRelationships`, `getPartRelationships` — takes the
+RAW json, which `normalize()` passes through alongside the stripped one. For the same reason,
+never set `removeNSPrefix: true` on the `XMLParser`.
+
+Two consequences worth remembering:
+- **Slide filenames are creation order.** `slideNumber` is the position in `p:sldIdLst`;
+  `metadata.fileSlideNumber` is the number in the filename, and that is what the rels graph is
+  keyed on. Anything resolving a slide's media takes `slideRelsFile`, never `slideIndex + 1`.
+- **Notes are matched through the rels graph**, never `slideN` ↔ `notesSlideM`.
+
 **`/packages/ppt-paste-parser/src/ClipboardParser.tsx`** - Main React component that handles clipboard paste events, detects PowerPoint cloud service metadata, extracts Microsoft API URLs, and calls the worker server to get parsed components.
 
 **`/apps/worker/worker.js`** - Cloudflare Worker with Hono framework that serves the client app and provides API endpoints. Bypasses CORS restrictions, calls Microsoft's GetClipboardBytes API, and uses the pptx-to-json package for parsing.
@@ -141,6 +157,7 @@ pnpm deploy
 - **ShapeParser.js**: Geometric shapes with fill, border, and effect parsing
 - **ImageParser.js**: Images with data URL extraction and effects
 - **TableParser.js**: Tables with cell structure and formatting
+- **SlideMetaParser.ts**: Slide titles and speaker notes — the text that describes a slide rather than drawing on it
 
 ### Architecture
 - **Modular Parser System**: Specialized parsers for different component types (TextParser, ShapeParser, ImageParser, TableParser)

@@ -273,11 +273,15 @@ export class BaseParser {
           ? paragraph["r"]
           : [paragraph["r"]];
         runs.forEach((run) => {
-          if (run["t"]) {
+          if (run["t"] !== undefined && run["t"] !== null) {
             // In fast-xml-parser, text is directly a string, not an array
             const text = run["t"];
             if (typeof text === "string") {
               paragraphText += text;
+            } else if (typeof text === "number" || typeof text === "boolean") {
+              // `parseTagValue` turns a run whose whole text is numeric into a NUMBER, so
+              // a heading of "2026" is not a string. Dropping it leaves no trace at all.
+              paragraphText += String(text);
             } else if (text._ && typeof text._ === "string") {
               paragraphText += text._;
             }

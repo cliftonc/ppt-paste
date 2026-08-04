@@ -66,6 +66,18 @@ interface MaxSlideIds {
   rid: number;
 }
 
+// A single entry from a .rels part
+export interface PartRelationship {
+  id: string;
+  type: string;
+  /** Target as written in the .rels file (may be relative, e.g. '../notesSlides/notesSlide1.xml') */
+  target: string;
+  /** 'External' targets point outside the package and are never resolved to a part path */
+  targetMode?: string;
+  /** Target resolved against the owning part's directory, e.g. 'ppt/notesSlides/notesSlide1.xml' */
+  resolvedTarget: string | null;
+}
+
 // Layout element type
 interface LayoutElement {
   type: 'shape' | 'image';
@@ -886,6 +898,223 @@ export class PPTXParser {
     }
     
     return false;
+  }
+
+  /**
+   * Resolve a relationship target against the part that declares it.
+   *
+   * Targets in a .rels file are relative to the DIRECTORY of the part it describes,
+   * not to the .rels file itself: 'ppt/slides/_rels/slide1.xml.rels' declaring
+   * '../notesSlides/notesSlide1.xml' means 'ppt/notesSlides/notesSlide1.xml'.
+   */
+  static resolveRelationshipTarget(relsFile: string, target: string): string | null {
+    if (!target) return null;
+
+    // Absolute package path: '/ppt/slides/slide1.xml'
+    if (target.startsWith('/')) return target.slice(1);
+
+    // 'ppt/slides/_rels/slide1.xml.rels' -> 'ppt/slides/'
+    const baseDir = relsFile.replace(/_rels\/[^/]*$/, '');
+
+    const segments = `${baseDir}${target}`.split('/');
+    const resolved: string[] = [];
+    for (const segment of segments) {
+      if (segment === '' || segment === '.') continue;
+      if (segment === '..') resolved.pop();
+      else resolved.push(segment);
+    }
+
+    return resolved.length > 0 ? resolved.join('/') : null;
+  }
+
+  /**
+   * Read one .rels part into a flat list of relationships.
+   *
+   * ⚠️ Takes the RAW parsed json (namespace prefixes intact). Relationship attributes
+   * (`Id`/`Type`/`Target`) carry no prefix, so this survives namespace stripping — but
+   * every caller of the rels graph below reads `r:id` somewhere, so keep them consistent.
+   */
+  getPartRelationships(json: PPTXJson, relsFile: string): PartRelationship[] {
+    const relData = json[relsFile] as XMLNode | undefined;
+    const rels = relData?.Relationships?.Relationship;
+    if (!rels) return [];
+
+    const relArray = Array.isArray(rels) ? rels : [rels];
+
+    return relArray
+      .filter(rel => rel && typeof rel === 'object')
+      .map(rel => {
+        const id = String(rel.$Id ?? '');
+        const type = String(rel.$Type ?? '');
+        const target = String(rel.$Target ?? '');
+        const targetMode = rel.$TargetMode ? String(rel.$TargetMode) : undefined;
+
+        return {
+          id,
+          type,
+          target,
+          targetMode,
+          resolvedTarget:
+            targetMode === 'External' ? null : PPTXParser.resolveRelationshipTarget(relsFile, target)
+        };
+      })
+      .filter(rel => rel.id !== '');
+  }
+
+  /**
+   * Slide files in PRESENTATION order.
+   *
+   * `ppt/presentation.xml` → `p:sldIdLst` → each `p:sldId/@r:id`, resolved through
+   * `ppt/_rels/presentation.xml.rels`. Slide FILENAMES are creation order, so a deck
+   * whose slides have been reordered has filenames that no longer match what the
+   * presenter sees; only this list is authoritative.
+   *
+   * ⚠️ Takes the RAW parsed json. `p:sldId` carries both an `id` and an `r:id`
+   * attribute, and they are different things — a namespace-stripped tree merges them
+   * (or drops one, depending on attribute order in the source), which resolves most
+   * decks correctly and a few silently wrongly. Returns `[]` when the list cannot be
+   * read, so callers fall back to filename order rather than to a guess.
+   */
+  getSlideOrder(json: PPTXJson): string[] {
+    const presentation = (json['ppt/presentation.xml'] as XMLNode | undefined)?.['p:presentation'];
+    if (!presentation) {
+      if ((json['ppt/presentation.xml'] as XMLNode | undefined)?.['presentation']) {
+        console.warn(
+          'getSlideOrder: presentation.xml has no `p:` prefix — this looks like namespace-stripped ' +
+            'json, where `r:id` cannot be told apart from `id`. Falling back to filename order.'
+        );
+      }
+      return [];
+    }
+
+    const sldIdLst = this.ensureFirst(presentation['p:sldIdLst']);
+    if (!sldIdLst) return [];
+
+    const slideIds = sldIdLst['p:sldId'];
+    if (!slideIds) return [];
+    const slideIdArray = Array.isArray(slideIds) ? slideIds : [slideIds];
+
+    const relsById = new Map<string, PartRelationship>();
+    for (const rel of this.getPartRelationships(json, 'ppt/_rels/presentation.xml.rels')) {
+      relsById.set(rel.id, rel);
+    }
+
+    const ordered: string[] = [];
+    for (const slideId of slideIdArray) {
+      // The namespaced attribute — NOT `$id`, which is the slide's own identifier
+      const rId = slideId?.['$r:id'];
+      if (rId === undefined || rId === null) continue;
+
+      const rel = relsById.get(String(rId));
+      if (!rel?.resolvedTarget) continue;
+      if (!(rel.resolvedTarget in json)) continue;
+
+      ordered.push(rel.resolvedTarget);
+    }
+
+    return ordered;
+  }
+
+  /**
+   * Map each slide file to its notes slide, THROUGH THE RELS GRAPH.
+   *
+   * ⚠️ Never pair `slideN.xml` with `notesSlideN.xml` by number. A notes part exists
+   * only for slides that have one, so the numbering diverges the moment any slide
+   * lacks notes — and notes attributed to the wrong slide are worse than no notes at
+   * all in a retrieval corpus, because nothing downstream can tell they moved.
+   *
+   * Slides with no notes part are simply absent from the map.
+   */
+  getSlideNotesRelationships(json: PPTXJson): Record<string, string> {
+    const notesBySlide: Record<string, string> = {};
+
+    const slideRelFiles = Object.keys(json).filter(key =>
+      /^ppt\/slides\/_rels\/slide\d+\.xml\.rels$/.test(key)
+    );
+
+    for (const relFile of slideRelFiles) {
+      const slideFile = relFile.replace('_rels/', '').replace(/\.rels$/, '');
+
+      const notesRel = this.getPartRelationships(json, relFile).find(rel =>
+        rel.type.endsWith('/notesSlide')
+      );
+
+      if (notesRel?.resolvedTarget && notesRel.resolvedTarget in json) {
+        notesBySlide[slideFile] = notesRel.resolvedTarget;
+      }
+    }
+
+    return notesBySlide;
+  }
+
+  /**
+   * Placeholder type by `idx`, for a layout or master file.
+   *
+   * A slide's own placeholder frequently omits `@type` (which then defaults to `body`)
+   * and identifies itself only by `idx`; the layout it inherits from is where that
+   * index is named. This is the lookup that turns such a placeholder back into a title.
+   *
+   * Unlike `getPlaceholderDefinitions`, placeholders with no geometry are KEPT — a
+   * placeholder that inherits its position still names its index.
+   */
+  getPlaceholderTypesByIdx(json: PPTXJson, layoutFile: string): Record<string, string> {
+    const types: Record<string, string> = {};
+    if (!json[layoutFile]) return types;
+
+    try {
+      const layoutData = json[layoutFile] as XMLNode;
+      const layout =
+        layoutData['p:sldLayout'] ||
+        layoutData['sldLayout'] ||
+        layoutData['p:sldMaster'] ||
+        layoutData['sldMaster'] ||
+        layoutData;
+      if (!layout) return types;
+
+      const cSld = layout['p:cSld'] || layout['cSld'];
+      const spTree = cSld && (cSld['p:spTree'] || cSld['spTree']);
+      if (!spTree) return types;
+
+      const collect = (elementArray: XMLNode | XMLNode[] | undefined) => {
+        if (!elementArray) return;
+        const arr = Array.isArray(elementArray) ? elementArray : [elementArray];
+
+        for (const element of arr) {
+          if (!element || typeof element !== 'object') continue;
+
+          const nvSpPr = element['p:nvSpPr'] || element['nvSpPr'];
+          const nvPr = nvSpPr?.['p:nvPr'] || nvSpPr?.['nvPr'];
+          const ph = nvPr?.['p:ph'] || nvPr?.['ph'];
+          if (!ph) continue;
+
+          const idx = ph.$idx ?? ph.idx;
+          const type = ph.$type ?? ph.type;
+          if (idx === undefined || idx === null || !type) continue;
+
+          types[String(idx)] = String(type);
+        }
+      };
+
+      collect(spTree['p:sp'] || spTree['sp']);
+
+      const grpSp = spTree['p:grpSp'] || spTree['grpSp'];
+      if (grpSp) {
+        const grpArray = Array.isArray(grpSp) ? grpSp : [grpSp];
+        for (const grp of grpArray) collect(grp['p:sp'] || grp['sp']);
+      }
+    } catch (error) {
+      console.warn(`Error extracting placeholder types from ${layoutFile}:`, error);
+    }
+
+    return types;
+  }
+
+  /**
+   * fast-xml-parser gives a single child as an object and repeated children as an array
+   */
+  private ensureFirst(value: any): any | null {
+    if (Array.isArray(value)) return value[0] ?? null;
+    return value ?? null;
   }
 
   /**

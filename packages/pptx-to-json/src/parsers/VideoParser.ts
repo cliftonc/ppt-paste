@@ -16,8 +16,10 @@ export class VideoParser extends BaseParser {
    * @param relationships - Relationship data
    * @param mediaFiles - Media files
    * @param componentIndex - Component index
-   * @param slideIndex - Slide index
+   * @param slideIndex - Slide index (position in presentation order)
    * @param r2Storage - Optional R2 storage for thumbnail hosting
+   * @param slideRelsFile - The slide's own .rels part; preferred over deriving one from
+   *   slideIndex, which assumes presentation order matches the slide's FILE number
    * @returns Parsed video component
    */
   static async parseFromNormalized(
@@ -27,7 +29,8 @@ export class VideoParser extends BaseParser {
     componentIndex: number,
     slideIndex: number,
     zIndex: number,
-    r2Storage: any = null
+    r2Storage: any = null,
+    slideRelsFile: string | null = null
   ): Promise<VideoComponent | null> {
     const { data, spPr, nvPicPr, blipFill, namespace, relationshipId } =
       videoComponent;
@@ -62,9 +65,10 @@ export class VideoParser extends BaseParser {
     );
 
     if (videoRelationshipId && relationships) {
-      if (!isClipboardFormat && slideIndex !== null) {
+      if (!isClipboardFormat && (slideRelsFile || slideIndex !== null)) {
         // For PPTX files, look in the slide's relationship file
-        const currentSlideRelFile = `ppt/slides/_rels/slide${slideIndex + 1}.xml.rels`;
+        const currentSlideRelFile =
+          slideRelsFile || `ppt/slides/_rels/slide${slideIndex + 1}.xml.rels`;
 
         if (relationships[currentSlideRelFile]) {
           const relsData =
@@ -122,9 +126,10 @@ export class VideoParser extends BaseParser {
       if (thumbnailRelationshipId && relationships && mediaFiles) {
         let thumbnailPath: string | null = null;
 
-        if (!isClipboardFormat && slideIndex !== null) {
+        if (!isClipboardFormat && (slideRelsFile || slideIndex !== null)) {
           // For PPTX files, look in the slide's relationship file
-          const currentSlideRelFile = `ppt/slides/_rels/slide${slideIndex + 1}.xml.rels`;
+          const currentSlideRelFile =
+            slideRelsFile || `ppt/slides/_rels/slide${slideIndex + 1}.xml.rels`;
 
           if (relationships[currentSlideRelFile]) {
             const relsData =

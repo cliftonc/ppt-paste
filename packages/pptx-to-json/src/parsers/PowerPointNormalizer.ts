@@ -8,6 +8,7 @@
 import { PPTXParser } from '../processors/PPTXParser.js';
 import { DEFAULT_SLIDE_WIDTH_PX, DEFAULT_SLIDE_HEIGHT_PX, pixelsToEmu } from '../utils/constants.js';
 import { BaseParser } from './BaseParser.js';
+import { SlideMetaParser } from './SlideMetaParser.js';
 
 import type { NormalizedElement, NormalizedSlide, NormalizedResult } from '../types/normalized.js';
 /* Inlined NormalizedElement/Slide/Result interfaces removed.
@@ -20,13 +21,15 @@ export class PowerPointNormalizer {
    */
   normalize(json: any): NormalizedResult {
     const formatType = this.detectFormat(json);
-    
+
     // Strip all namespaces from the entire JSON structure at the very start
     const strippedJson = this.stripNamespaces(json);
-    
+
     switch (formatType) {
       case 'pptx':
-        return this.normalizePPTX(strippedJson, formatType);
+        // The RAW json is passed alongside: the rels graph (slide order, notes) is read
+        // from it, because stripping namespaces makes `r:id` indistinguishable from `id`
+        return this.normalizePPTX(strippedJson, formatType, json);
       case 'clipboard':
         return this.normalizeClipboard(strippedJson, formatType);
       default:
@@ -56,35 +59,57 @@ export class PowerPointNormalizer {
   /**
    * Normalize PPTX file structure
    */
-  normalizePPTX(json: any, formatType: string): NormalizedResult {
+  normalizePPTX(json: any, formatType: string, rawJson?: any): NormalizedResult {
     const slides: NormalizedSlide[] = [];
     const files = Object.keys(json);
-    
+
     // Create PPTXParser instance for layout extraction
     const pptxParser = new PPTXParser();
-    
+
     // Get slide-to-layout relationships
     const slideLayoutRelationships = pptxParser.getSlideLayoutRelationships(json);
-    
+
     // Extract slide dimensions from presentation.xml
     const slideDimensions = pptxParser.getSlideDimensions(json);
-    
+
     // Extract theme data from theme file
     const themeData = this.extractThemeData(json, 'pptx');
-    
+
+    // The rels graph is read from the RAW tree — see normalize() above. Callers that
+    // reach normalizePPTX directly with only a stripped tree still work, they just fall
+    // back to filename order and get no notes.
+    const relsSource = rawJson ?? json;
+    const slideOrder = pptxParser.getSlideOrder(relsSource);
+    const notesRelationships = pptxParser.getSlideNotesRelationships(relsSource);
+    const slideOrderSource: 'presentation' | 'filename' = slideOrder.length > 0 ? 'presentation' : 'filename';
+    const orderByFile = new Map(slideOrder.map((file, index) => [file, index]));
+
+    // idx → placeholder type per layout, so a slide placeholder carrying only an idx
+    // can still be recognised as the title. Parsed once per layout, not once per slide.
+    const layoutPlaceholderTypes = new Map<string, Record<string, string>>();
+    const placeholderTypesFor = (layoutFile: string | undefined): Record<string, string> => {
+      if (!layoutFile) return {};
+      if (!layoutPlaceholderTypes.has(layoutFile)) {
+        layoutPlaceholderTypes.set(layoutFile, pptxParser.getPlaceholderTypesByIdx(json, layoutFile));
+      }
+      return layoutPlaceholderTypes.get(layoutFile) as Record<string, string>;
+    };
+
     // Find slide files (no sorting needed - we'll extract slide numbers)
-    const slideFiles = files.filter(f => 
+    const slideFiles = files.filter(f =>
       f.startsWith('ppt/slides/slide') && f.endsWith('.xml')
     );
-    
+
     for (const slideFile of slideFiles) {
       const slideData = json[slideFile];
       if (!slideData || !slideData['sld']) continue;
-      
-      // Extract slide number from filename (e.g., 'ppt/slides/slide5.xml' -> 5)
+
+      // Extract slide number from the FILENAME (e.g., 'ppt/slides/slide5.xml' -> 5).
+      // This is creation order, not presentation order — the two are reconciled below.
       const slideNumberMatch = slideFile.match(/slide(\d+)\.xml/);
-      const slideNumber = slideNumberMatch ? parseInt(slideNumberMatch[1], 10) : 1;
-      
+      const fileSlideNumber = slideNumberMatch ? parseInt(slideNumberMatch[1], 10) : 1;
+      const slideNumber = fileSlideNumber;
+
       // Extract slide content
       const slide = slideData['sld'];
       const cSld = this.ensureObject(slide['cSld']) || slide;
@@ -197,9 +222,19 @@ export class PowerPointNormalizer {
       // 3. Slide elements (foreground, z-index 0+)
       const allElements = [...masterElements, ...layoutElements, ...slideElements];
       
+      const notesFile = notesRelationships[slideFile];
+      const notes = notesFile ? SlideMetaParser.extractNotes(json[notesFile]) : null;
+      const title = SlideMetaParser.extractTitle(spTree, placeholderTypesFor(layoutFile));
+
       const normalizedSlide: NormalizedSlide = {
         slideFile,
-        slideNumber, // Add extracted slide number
+        slideNumber, // Presentation position, assigned after sorting below
+        fileSlideNumber, // The number in the filename — creation order
+        slideRelsFile: `ppt/slides/_rels/slide${fileSlideNumber}.xml.rels`,
+        title: title?.text,
+        titleSource: title?.source,
+        notes: notes ?? undefined,
+        notesFile: notesFile ?? null,
         format: 'pptx',
         shapes: this.extractPPTXShapes(spTree),
         images: this.extractPPTXImages(spTree),
@@ -215,10 +250,36 @@ export class PowerPointNormalizer {
       
       slides.push(normalizedSlide);
     }
-    
+
+    // Put the slides in the order the deck is presented in.
+    //
+    // Until now they were in whatever order the zip listed them, and their number came
+    // from the filename. Both are creation order: PowerPoint keeps a slide's part name
+    // when the deck is reordered, so slide3.xml can be the seventh slide shown. The
+    // authoritative order is p:sldIdLst (see PPTXParser.getSlideOrder); filename number
+    // is the fallback when there is no readable presentation part, and is kept as
+    // `fileSlideNumber` either way because the rels graph is keyed on it.
+    slides.sort((a, b) => {
+      const aOrder = orderByFile.get(a.slideFile);
+      const bOrder = orderByFile.get(b.slideFile);
+      // Slides absent from sldIdLst are not presented; keep them last, in filename order
+      if (aOrder === undefined || bOrder === undefined) {
+        if (aOrder === undefined && bOrder === undefined) {
+          return (a.fileSlideNumber ?? 0) - (b.fileSlideNumber ?? 0);
+        }
+        return aOrder === undefined ? 1 : -1;
+      }
+      return aOrder - bOrder;
+    });
+
+    slides.forEach((slide, index) => {
+      slide.slideNumber = index + 1;
+    });
+
     return {
       format: 'pptx',
       slides,
+      slideOrderSource,
       slideDimensions,
       mediaFiles: this.extractMediaFiles(json),
       relationships: this.extractRelationships(json),

@@ -15,18 +15,18 @@ import type { PowerPointComponent, ConnectionComponent, PlaceholderMap, XMLNode 
 
 import { isTextElement, isShapeElement, isImageElement, isTableElement, isDiagramElement, isVideoElement, isConnectionElement, type NormalizedTextElement, type NormalizedShapeElement, type NormalizedImageElement, type NormalizedTableElement, type NormalizedDiagramElement, type NormalizedVideoElement, type NormalizedConnectionElement, type MediaFiles, type RelationshipGraph, type NormalizedSlide } from '../types/normalized.js';
 
-interface R2BucketLike {
+export interface R2BucketLike {
   put?(key: string, value: any, options?: any): Promise<any> | any;
   get?(key: string): Promise<any> | any;
   head?(key: string): Promise<any> | any;
 }
 
-interface ParseOptions {
+export interface ParseOptions {
   debug?: boolean;
   r2Storage?: R2BucketLike | null;
 }
 
-interface SlideMetadata {
+export interface SlideMetadata {
   name: string;
   componentCount: number;
   format: string;
@@ -35,9 +35,15 @@ interface SlideMetadata {
   masterFile: string | null;
   layoutElementCount: number;
   masterElementCount: number;
+  /** Notes part resolved through the rels graph, or null when the slide has none */
+  notesFile: string | null;
+  /** The number in the slide's filename — creation order, not presentation order */
+  fileSlideNumber: number | null;
+  /** How the title was identified: by the slide's own placeholder, or via the layout */
+  titleSource: 'placeholder' | 'layout' | null;
 }
 
-interface ParsedMaster {
+export interface ParsedMaster {
   id: string;
   name: string;
   background?: PowerPointComponent;
@@ -47,7 +53,7 @@ interface ParsedMaster {
   textStyles?: { titleStyle?: XMLNode, bodyStyle?: XMLNode };
 }
 
-interface ParsedLayout {
+export interface ParsedLayout {
   id: string;
   name: string;
   masterId?: string;
@@ -57,21 +63,25 @@ interface ParsedLayout {
   placeholders?: PlaceholderMap;
 }
 
-interface ParsedSlide {
-  slideIndex: number; // zero-based index used internally
-  slideNumber: number; // 1-based slide number surfaced to callers
+export interface ParsedSlide {
+  slideIndex: number; // zero-based position in presentation order
+  slideNumber: number; // 1-based position in presentation order (what the audience sees)
+  title?: string; // Text of the title placeholder, when the slide has one
+  notes?: string; // Speaker notes, when the slide has any
   layoutId?: string; // Reference to layout
   background?: PowerPointComponent; // Slide-specific background
   components: PowerPointComponent[];
   metadata: SlideMetadata;
 }
 
-interface ParsedResult {
+export interface ParsedResult {
   slides: ParsedSlide[];
   masters: Record<string, ParsedMaster>;
   layouts: Record<string, ParsedLayout>;
   totalComponents: number;
   format: string; // 'pptx' | 'clipboard'
+  /** 'presentation' when p:sldIdLst decided the order, 'filename' when it could not be read */
+  slideOrderSource?: 'presentation' | 'filename';
   slideDimensions?: {
     width: number;
     height: number;
@@ -381,6 +391,10 @@ export class PowerPointParser extends BaseParser {
         let slideBackground: PowerPointComponent | undefined;
         const layoutId = slide.layoutFile ? slide.layoutFile.replace('ppt/slideLayouts/', '').replace('.xml', '') : undefined;
         let localComponentIndex = 0;
+        // Media, videos and SmartArt parts are resolved through THIS slide's rels part.
+        // It is passed explicitly because the alternative — `ppt/slides/_rels/slide${slideNumber}.xml.rels`
+        // — silently reads another slide's relationships once a deck has been reordered.
+        const slideRelsFile = slide.slideRelsFile ?? null;
         
         // Build combined placeholder map for this slide (master → layout inheritance)
         let combinedPlaceholders: PlaceholderMap = {};
@@ -412,7 +426,7 @@ export class PowerPointParser extends BaseParser {
             
             // Handle slide-specific background
             if (element.isBackgroundElement && !element.isMasterElement && !element.isLayoutElement) {
-              const bgComponent = await this.parseElementToComponent(element, normalized.relationships, normalized.mediaFiles, globalComponentIndex++, slideNumber - 1, -500, { debug, r2Storage });
+              const bgComponent = await this.parseElementToComponent(element, normalized.relationships, normalized.mediaFiles, globalComponentIndex++, slideNumber - 1, -500, { debug, r2Storage, slideRelsFile });
               // Only set as background if it's not a white/near-white background
               // Exception: Always allow image backgrounds regardless of fill color
               if (bgComponent && (bgComponent.type === 'image' || (bgComponent.style?.fillColor && !BaseParser.isWhiteOrNearWhite(bgComponent.style.fillColor)))) {
@@ -451,7 +465,7 @@ export class PowerPointParser extends BaseParser {
                 globalComponentIndex++,
                 slideNumber - 1, // relationships index
                 element.zIndex,
-                { debug, r2Storage }
+                { debug, r2Storage, slideRelsFile }
               );
             } else if (isTableElement(element)) {
               component = await this.parseUnifiedTableComponent(
@@ -471,7 +485,7 @@ export class PowerPointParser extends BaseParser {
                 globalComponentIndex++,
                 slideNumber - 1,
                 element.zIndex,
-                { debug }
+                { debug, slideRelsFile }
               );
               if (Array.isArray(diagramResult)) {
                 slideComponents.push(...diagramResult);
@@ -487,7 +501,7 @@ export class PowerPointParser extends BaseParser {
                 globalComponentIndex++,
                 slideNumber - 1,
                 element.zIndex,
-                { debug, r2Storage }
+                { debug, r2Storage, slideRelsFile }
               );
             } else if (isConnectionElement(element)) {
               component = await this.parseUnifiedConnectionComponent(
@@ -560,7 +574,7 @@ export class PowerPointParser extends BaseParser {
               globalComponentIndex++,
               slideNumber - 1,
               localComponentIndex,
-              { debug, r2Storage }
+              { debug, r2Storage, slideRelsFile }
             );
             if (component) {
               slideComponents.push(component);
@@ -569,7 +583,7 @@ export class PowerPointParser extends BaseParser {
             }
           }
 
-          
+
           // Process video components
           for (const videoComponent of slide.videos) {
             const component = await this.parseUnifiedVideoComponent(
@@ -579,7 +593,7 @@ export class PowerPointParser extends BaseParser {
               globalComponentIndex++,
               slideNumber - 1,
               localComponentIndex,
-              { debug, r2Storage }
+              { debug, r2Storage, slideRelsFile }
             );
             if (component) {
               slideComponents.push(component);
@@ -588,23 +602,28 @@ export class PowerPointParser extends BaseParser {
             }
           }
         }
-        
+
         // Create slide object
         const slideObject: ParsedSlide = {
           slideIndex: slideNumber - 1, // For compatibility, keep 0-based index
-          slideNumber: slideNumber,    // Actual slide number from filename
+          slideNumber: slideNumber,    // Position in presentation order
+          title: slide.title,
+          notes: slide.notes,
           layoutId,
           background: slideBackground,
           components: slideComponents,
           metadata: {
-            name: `Slide ${slideNumber}`,
+            name: slide.title || `Slide ${slideNumber}`,
             componentCount: slideComponents.length,
             format: normalized.format,
             slideFile: slide.slideFile || null,
             layoutFile: slide.layoutFile || null,
             masterFile: slide.masterFile || null,
             layoutElementCount: slide.layoutElementCount || 0,
-            masterElementCount: slide.masterElementCount || 0
+            masterElementCount: slide.masterElementCount || 0,
+            notesFile: slide.notesFile ?? null,
+            fileSlideNumber: slide.fileSlideNumber ?? null,
+            titleSource: slide.titleSource ?? null
           }
         };
         
@@ -644,6 +663,7 @@ export class PowerPointParser extends BaseParser {
         layouts,
         totalComponents: components.length,
         format: normalized.format,
+        slideOrderSource: normalized.slideOrderSource,
         slideDimensions: normalized.slideDimensions
       };
 
@@ -665,10 +685,10 @@ export class PowerPointParser extends BaseParser {
     componentIndex: number,
     slideIndex: number,
     zIndex: number,
-    options: { debug?: boolean; r2Storage?: R2BucketLike | null } = {}
+    options: { debug?: boolean; r2Storage?: R2BucketLike | null; slideRelsFile?: string | null } = {}
   ): Promise<PowerPointComponent | null> {
-    const { debug = false, r2Storage = null } = options;
-    
+    const { debug = false, r2Storage = null, slideRelsFile = null } = options;
+
     if (debug) {
       // console.warn(`parseElementToComponent called with element.type: ${element.type}`);
       // console.warn(`Element data keys:`, Object.keys(element.data || {}));
@@ -727,7 +747,7 @@ export class PowerPointParser extends BaseParser {
         componentIndex,
         slideIndex,
         zIndex,
-        { debug, r2Storage }
+        { debug, r2Storage, slideRelsFile }
       );
     } else if (element.type === 'table' && isTableElement(normalizedElement)) {
       return await this.parseUnifiedTableComponent(
@@ -747,7 +767,7 @@ export class PowerPointParser extends BaseParser {
         componentIndex,
         slideIndex,
         zIndex,
-        { debug }
+        { debug, slideRelsFile }
       );
       // For parseElement, return the first component if it's an array
       if (Array.isArray(diagramResult)) {
@@ -762,7 +782,7 @@ export class PowerPointParser extends BaseParser {
         componentIndex,
         slideIndex,
         zIndex,
-        { debug, r2Storage }
+        { debug, r2Storage, slideRelsFile }
       );
     } else if (element.type === 'connection' && isConnectionElement(normalizedElement)) {
       return await this.parseUnifiedConnectionComponent(
@@ -834,11 +854,11 @@ export class PowerPointParser extends BaseParser {
     componentIndex: number,
     relSlideIndex: number,
     zIndex: number,
-    options: { debug?: boolean; r2Storage?: R2BucketLike | null } = {}
+    options: { debug?: boolean; r2Storage?: R2BucketLike | null; slideRelsFile?: string | null } = {}
   ): Promise<PowerPointComponent | null> {
-    const { debug = false, r2Storage = null } = options;
+    const { debug = false, r2Storage = null, slideRelsFile = null } = options;
     try {
-      return await ImageParser.parseFromNormalized(imageComponent, relationships, mediaFiles, componentIndex, relSlideIndex, zIndex, r2Storage);
+      return await ImageParser.parseFromNormalized(imageComponent, relationships, mediaFiles, componentIndex, relSlideIndex, zIndex, r2Storage, slideRelsFile);
     } catch (error) {
       if (debug) console.warn(`Failed to parse image component:`, error);
       return null;
@@ -876,11 +896,11 @@ export class PowerPointParser extends BaseParser {
     componentIndex: number,
     relSlideIndex: number,
     zIndex: number,
-    options: { debug?: boolean } = {}
+    options: { debug?: boolean; slideRelsFile?: string | null } = {}
   ): Promise<PowerPointComponent | PowerPointComponent[] | null> {
-    const { debug = false } = options;
+    const { debug = false, slideRelsFile = null } = options;
     try {
-      return await DiagramParser.parseFromNormalized(diagramComponent, componentIndex, relSlideIndex, zIndex, this.normalizedJson, { returnExtractedComponents: true });
+      return await DiagramParser.parseFromNormalized(diagramComponent, componentIndex, relSlideIndex, zIndex, this.normalizedJson, { returnExtractedComponents: true, slideRelsFile });
     } catch (error) {
       if (debug) console.warn(`Failed to parse diagram component:`, error);
       return null;
@@ -895,13 +915,13 @@ export class PowerPointParser extends BaseParser {
     _relationships: RelationshipGraph,
     _mediaFiles: MediaFiles,
     componentIndex: number, 
-    relSlideIndex: number, 
+    relSlideIndex: number,
     zIndex: number,
-    options: { debug?: boolean; r2Storage?: R2BucketLike | null } = {}
+    options: { debug?: boolean; r2Storage?: R2BucketLike | null; slideRelsFile?: string | null } = {}
   ): Promise<PowerPointComponent | null> {
-    const { debug = false, r2Storage = null } = options;
+    const { debug = false, r2Storage = null, slideRelsFile = null } = options;
     try {
-      return await VideoParser.parseFromNormalized(videoComponent, _relationships, _mediaFiles, componentIndex, relSlideIndex, zIndex, r2Storage);
+      return await VideoParser.parseFromNormalized(videoComponent, _relationships, _mediaFiles, componentIndex, relSlideIndex, zIndex, r2Storage, slideRelsFile);
     } catch (error) {
       if (debug) console.warn(`Failed to parse video component:`, error);
       return null;
